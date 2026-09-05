@@ -50,6 +50,23 @@ class _GoodLlmProvider:
         return [{"source": "Email", "target": "email", "confidence": 0.98}]
 
 
+async def _wait_for_refinement(import_id):
+    """Wait for the background LLM refinement for an import to finish.
+
+    The suggestions endpoint returns deterministic heuristics immediately and
+    runs the AI refinement as a non-blocking background task; this helper lets
+    tests observe the upgraded (second) response deterministically.
+    """
+    import asyncio
+
+    for _ in range(200):
+        entry = imports_api._llm_mapping_cache.get(str(import_id))
+        if entry is not None and entry.get("done"):
+            return entry
+        await asyncio.sleep(0.01)
+    pytest.fail("background AI refinement did not complete in time")
+
+
 @pytest.fixture
 async def test_session():
     """Isolated in-memory async SQLite session with all tables created."""
@@ -121,6 +138,17 @@ async def test_suggestions_fall_back_to_heuristics_when_nvidia_fails(
     assert import_with_file.status == ImportStatus.UPLOADED.value
     assert import_with_file.error_message is None
 
+    # Let the background refinement finish (it fails silently), then verify the
+    # endpoint keeps returning safe heuristics with a sanitized provider_error.
+    await _wait_for_refinement(import_with_file.id)
+    response2 = await imports_api.get_mapping_suggestions(
+        str(import_with_file.id), test_session
+    )
+    assert response2["refinement_pending"] is False
+    assert response2["source"] == "heuristic"
+    assert all(s.get("suggested_by") != "llm" for s in response2["suggestions"])
+    assert response2["provider_error"] and "heuristic" in response2["provider_error"]
+
 
 @pytest.mark.asyncio
 async def test_suggestions_survive_missing_preview_file(
@@ -154,16 +182,32 @@ async def test_suggestions_survive_missing_preview_file(
 async def test_suggestions_use_llm_output_when_available(
     test_session, import_with_file, monkeypatch
 ):
+    """The AI refinement is async: the FIRST response is instant heuristics with
+    `refinement_pending`, and a later request returns the LLM result."""
     def _good_factory():
         return _GoodLlmProvider()
 
     monkeypatch.setattr(imports_api, "get_llm_provider", _good_factory)
 
+    # First call — must NOT wait on the AI provider (deterministic heuristics).
     response = await imports_api.get_mapping_suggestions(
         str(import_with_file.id), test_session
     )
 
-    llm_picked = [s for s in response["suggestions"] if s.get("suggested_by") == "llm"]
+    # Instant deterministic pre-fill is returned with a pending-refinement flag.
+    assert response["refinement_pending"] is True
+    assert response["source"] == "heuristic"
+    assert response["suggestions"], "heuristics must always pre-fill the UI"
+    assert all(s.get("suggested_by") != "llm" for s in response["suggestions"])
+    assert response["collision_errors"] == []
+
+    # Background refinement completes, then the next request upgrades to LLM.
+    await _wait_for_refinement(import_with_file.id)
+    response2 = await imports_api.get_mapping_suggestions(
+        str(import_with_file.id), test_session
+    )
+    assert response2["refinement_pending"] is False
+    llm_picked = [s for s in response2["suggestions"] if s.get("suggested_by") == "llm"]
     assert llm_picked, "LLM suggestion should be surfaced with suggested_by='llm'"
     assert llm_picked[0]["source_column"] == "Email"
     assert llm_picked[0]["target_field"] == "email"

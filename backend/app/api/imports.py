@@ -1,6 +1,7 @@
 """Import API — upload, preview, mapping, processing."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -23,6 +24,78 @@ from app.schemas.schemas import ImportPreview, ColumnMappingConfirm, ColumnMappi
 router = APIRouter(prefix="/api/imports", tags=["imports"])
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+# In-memory cache of non-blocking LLM column-mapping refinement results, keyed
+# by import id. The mapping UI never waits on the AI: deterministic heuristic
+# suggestions are returned immediately and the AI result upgrades subsequent
+# requests once it lands. A single-entry per import keeps memory trivial.
+_llm_mapping_cache: dict[str, dict[str, Any]] = {}
+
+
+def _select_llm_suggestions(raw: Any) -> list[dict[str, Any]] | None:
+    """Normalize a raw LLM mapping response into the canonical suggestion shape."""
+    if not isinstance(raw, list):
+        return None
+    try:
+        selected = [
+            {
+                "source_column": str(s.get("source", s.get("source_column", ""))),
+                "target_field": str(s.get("target", s.get("target_field", ""))),
+                "confidence": s.get("confidence", 0.9),
+                "suggested_by": "llm",
+            }
+            for s in raw
+            if s.get("source") or s.get("source_column")
+        ]
+        return selected or None
+    except Exception:
+        return None
+
+
+async def _run_llm_refinement(
+    import_id: str, source_columns: list[str], sample_rows: list[dict]
+) -> None:
+    """Best-effort background AI column-mapping refinement.
+
+    Daemonized with asyncio so the suggestions endpoint returns instantly.
+    Any failure (outage, invalid key, garbage output, cancel) is logged and
+    leaves the previously-returned heuristic suggestions untouched — a
+    temporary AI failure can never block or break the mapping UI.
+    """
+    entry = _llm_mapping_cache.setdefault(import_id, {
+        "done": False, "suggestions": None, "source": "heuristic", "error": None,
+    })
+    try:
+        provider = get_llm_provider()
+        raw = await provider.suggest_column_mappings(
+            source_columns, TARGET_FIELDS, sample_rows,
+        )
+        selected = _select_llm_suggestions(raw)
+        entry["done"] = True
+        entry["suggestions"] = selected
+        if selected:
+            entry["source"] = "llm"
+        else:
+            entry["error"] = (
+                "AI mapping refinement returned nothing usable — "
+                "using heuristic suggestions"
+            )
+    except asyncio.CancelledError:
+        entry["done"] = True
+        entry["error"] = (
+            "AI mapping refinement was cancelled — using heuristic suggestions"
+        )
+        raise
+    except Exception as exc:
+        logger.warning(
+            "AI column-mapping refinement failed for import %s (%s: %s) — "
+            "heuristic suggestions are already returned",
+            import_id, type(exc).__name__, exc,
+        )
+        entry["done"] = True
+        entry["error"] = (
+            "AI mapping refinement failed — using heuristic suggestions"
+        )
 
 
 def _org_id() -> uuid.UUID:
@@ -134,41 +207,43 @@ async def get_import(import_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{import_id}/suggestions")
 async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get_db)):
-    """Get AI-suggested column mappings (heuristic + optional LLM refinement).
+    """Get column mappings (deterministic heuristic + optional LLM refinement).
 
     Phase 2: collision detection runs on the heuristic suggestions and the
     result is returned alongside them so the UI can show what was auto-selected
     and what was dropped.
 
-    Resilience (production incident 2026-09-05): the AI provider call is
-    best-effort. Any NVIDIA failure — missing SDK, invalid credentials,
-    outage, rate limit, malformed output — is logged (never the API key)
-    and the endpoint degrades to the deterministic heuristic suggestions
-    so a temporary AI failure can never fail an import.
+    Performance (production incident 2026-09-05): this endpoint NEVER waits on
+    the AI. The deterministic heuristic suggestions are computed locally and
+    returned immediately; when an NVIDIA provider is configured, the LLM
+    refinement is dispatched as a background task and its result upgrades
+    subsequent requests (``refinement_pending`` tells the client whether to
+    re-fetch). Any NVIDIA failure — missing SDK, invalid credentials, outage,
+    rate limit, malformed output — is logged (never the API key) and leaves
+    the already-returned heuristic suggestions in place.
     """
     data_import = await db.get(DataImport, uuid.UUID(import_id))
     if not data_import:
         raise HTTPException(404, "Import not found")
 
-    # A missing/unreadable raw file (e.g. ephemeral /tmp storage restart on
-    # Render) must not 500 — fall back to the persisted column/preview metadata
-    # that was captured at upload time.
-    preview = None
-    try:
-        preview = import_service.read_file_preview(data_import.raw_storage_path)
-    except Exception as exc:
-        logger.warning(
-            "Could not read stored preview file for import %s (%s: %s) — "
-            "falling back to persisted metadata",
-            import_id, type(exc).__name__, exc,
-        )
-
-    if preview:
-        source_columns = preview["columns"]
-        sample_rows = preview["preview_rows"][:3]
-    else:
-        source_columns = data_import.columns_list
-        sample_rows = data_import.preview_rows_list[:3]
+    # Source columns — prefer the persisted metadata captured at upload time
+    # (no file re-parse, survives ephemeral /tmp restarts), falling back to the
+    # raw file only for imports uploaded before the persistence fix.
+    source_columns = data_import.columns_list
+    sample_rows = data_import.preview_rows_list[:3]
+    if not source_columns:
+        try:
+            preview = import_service.read_file_preview(
+                data_import.raw_storage_path
+            )
+            source_columns = preview["columns"]
+            sample_rows = preview["preview_rows"][:3]
+        except Exception as exc:
+            logger.warning(
+                "Could not read stored preview file for import %s (%s: %s) — "
+                "falling back to persisted metadata",
+                import_id, type(exc).__name__, exc,
+            )
 
     # If neither the raw file nor persisted preview metadata is available
     # (e.g. an import uploaded before the persistence fix, then the server
@@ -184,62 +259,43 @@ async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get
             ),
         )
 
-    # Best-effort AI refinement — NVIDIA failures must never break imports.
-    # NOTE: the OpenAI SDK never includes the API key in exception messages.
-    from app.ai.llm_provider import NoOpLLMProvider
-    llm_suggestions: list[dict[str, Any]] = []
-    llm_provider_obj = get_llm_provider()
-    provider_is_noop = isinstance(llm_provider_obj, NoOpLLMProvider)
-
-    if not provider_is_noop:
-        try:
-            llm_suggestions = await llm_provider_obj.suggest_column_mappings(
-                source_columns, TARGET_FIELDS, sample_rows,
-            )
-        except Exception as exc:
-            logger.warning(
-                "AI column-mapping provider unavailable for import %s (%s: %s) — "
-                "falling back to heuristic suggestions",
-                import_id, type(exc).__name__, exc,
-            )
-            llm_suggestions = []
-
-    # Phase 2: enforce one-target-one-source on EVERY source of suggestions.
-    if llm_suggestions and not isinstance(llm_suggestions, list):
-        llm_suggestions = []
+    # Deterministic local baseline — computed synchronously in microseconds.
     mapping_result = suggest_mappings(source_columns, TARGET_FIELDS)
     heuristic_suggestions = mapping_result["suggestions"]
     collisions = mapping_result["collisions"]
 
-    # Track the provenance so the UI can report which source was used.
-    provider_error: str | None = None
-    mapping_source = "heuristic"
+    # AI refinement is best-effort and NEVER on the response path: NVIDIA
+    # failures, outages, or rate limits must not delay the mapping UI. The
+    # deterministic heuristic suggestions are returned immediately; the LLM
+    # runs in a background task and its result upgrades later requests.
+    from app.ai.llm_provider import NoOpLLMProvider
+    llm_provider_obj = get_llm_provider()
+    provider_is_noop = isinstance(llm_provider_obj, NoOpLLMProvider)
 
-    # If the LLM returned structured suggestions (list of {source_column,
-    # target_field}), use them — but still enforce collision resolution.
     chosen = heuristic_suggestions
-    if not provider_is_noop and isinstance(llm_suggestions, list) and llm_suggestions:
-        try:
-            selected = [
-                {
-                    "source_column": str(s.get("source", s.get("source_column", ""))),
-                    "target_field": str(s.get("target", s.get("target_field", ""))),
-                    "confidence": s.get("confidence", 0.9),
-                    "suggested_by": "llm",
-                }
-                for s in llm_suggestions
-                if s.get("source") or s.get("source_column")
-            ]
-            if selected:
-                chosen = selected
-                mapping_source = "llm"
-        except Exception:
-            chosen = heuristic_suggestions
-            provider_error = "LLM response parsing failed"
-    elif provider_is_noop:
+    mapping_source = "heuristic"
+    provider_error: str | None = None
+    refinement_pending = False
+
+    if provider_is_noop:
         provider_error = "LLM not configured — using heuristic suggestions"
-    elif not llm_suggestions:
-        provider_error = "NVIDIA provider unavailable — using heuristic suggestions"
+    else:
+        cache_key = str(data_import.id)
+        cached = _llm_mapping_cache.get(cache_key)
+        if cached is None:
+            # First request for this import → return heuristics NOW and let the
+            # LLM refinement finish in the background (frontend polls once ready).
+            asyncio.create_task(_run_llm_refinement(
+                cache_key, source_columns, sample_rows,
+            ))
+            refinement_pending = True
+        elif not cached["done"]:
+            refinement_pending = True
+        else:
+            provider_error = cached.get("error")
+            if cached.get("suggestions"):
+                chosen = cached["suggestions"]
+                mapping_source = cached.get("source", "llm")
 
     errors = validate_no_collisions(chosen)
     return {
@@ -249,6 +305,7 @@ async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get
         "source": mapping_source,
         "provider_error": provider_error,
         "collision_errors": errors,
+        "refinement_pending": refinement_pending,
     }
 
 

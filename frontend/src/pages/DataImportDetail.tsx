@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -51,6 +51,9 @@ interface SuggestionsResponse {
   target_fields?: string[];
   source?: "llm" | "heuristic";
   provider_error?: string | null;
+  /** True while the backend runs the optional AI refinement in the background —
+   *  the heuristic pre-fill is already usable, and a refetch will upgrade it. */
+  refinement_pending?: boolean;
 }
 
 export const DataImportDetail: React.FC = () => {
@@ -61,6 +64,9 @@ export const DataImportDetail: React.FC = () => {
   const [mappings, setMappings] = useState<Record<string, string>>({});
   const [step, setStep] = useState<1 | 2 | 3 | 4>(2); // 1: Upload (done), 2: Preview & Map, 3: Process, 4: Results
   const [processingStats, setProcessingStats] = useState<any>(null);
+  // Once the user hand-adjusts a dropdown, never clobber their choice again —
+  // even when the async AI refinement lands and the suggestions are re-fetched.
+  const userEditedRef = useRef(false);
 
   const { data: importData, isLoading } = useQuery<ImportPreview>({
     queryKey: ['import-detail', id],
@@ -73,11 +79,16 @@ export const DataImportDetail: React.FC = () => {
     queryFn: () => fetchApi(`/imports/${id}/suggestions`),
     enabled: !!id,
     retry: false,
+    // The backend returns deterministic heuristics immediately and refines them
+    // with the AI in the background. Poll lightly while refinement is pending so
+    // the better mapping lands as soon as it is ready — never blocking first paint.
+    refetchInterval: (query) =>
+      (query.state.data as SuggestionsResponse | undefined)?.refinement_pending ? 2000 : false,
   });
 
-  // Pre-fill mappings from suggestions or previous mappings
+  // Pre-fill mappings from suggestions, but never overwrite a manual selection.
   useEffect(() => {
-    if (suggestionsData?.suggestions) {
+    if (!userEditedRef.current && suggestionsData?.suggestions) {
       const initial: Record<string, string> = {};
       suggestionsData.suggestions.forEach((s) => {
         initial[s.source_column] = s.target_field;
@@ -230,7 +241,10 @@ export const DataImportDetail: React.FC = () => {
 
                   <select
                     value={mappings[col] || ''}
-                    onChange={(e) => setMappings({ ...mappings, [col]: e.target.value })}
+                    onChange={(e) => {
+                      userEditedRef.current = true;
+                      setMappings({ ...mappings, [col]: e.target.value });
+                    }}
                     className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-blue-500 max-w-[200px]"
                   >
                     <option value="">— Ignore Column —</option>
