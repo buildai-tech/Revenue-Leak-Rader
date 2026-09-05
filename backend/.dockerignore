@@ -1,0 +1,37 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Local database (never ship in Docker image) ───────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.db.bak_*
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Uploads (runtime data, mounted via volume or cloud storage) ────────────────
+uploads/
+
+# ── Dev/Test files ────────────────────────────────────────────────────────────
+test_*.py
+tests/
+fix_pipeline.py
+*.bak
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.sw?

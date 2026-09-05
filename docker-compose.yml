@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: revenue_radar_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: revenue_radar
+      POSTGRES_PASSWORD: revenue_radar
+      POSTGRES_DB: revenue_radar
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U revenue_radar"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
