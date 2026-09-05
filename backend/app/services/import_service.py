@@ -11,6 +11,7 @@ The processing pipeline (triggered after mapping confirmation):
 """
 from __future__ import annotations
 
+import json
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -137,7 +138,12 @@ async def create_import(
     file_type: str,
     file_content: bytes,
 ) -> DataImport:
-    """Save uploaded file and create an import record."""
+    """Save uploaded file and create an import record.
+
+    Persists ``persisted_columns`` and ``persisted_preview_rows`` to the database
+    at upload time so that column-mapping suggestions can be reconstructed even
+    when the ephemeral ``/tmp`` storage on Render is lost after a restart.
+    """
     import_id = uuid.uuid4()
     safe_name = sanitize_filename(filename)
     upload_dir = Path(settings.UPLOAD_DIR) / str(import_id)
@@ -146,6 +152,11 @@ async def create_import(
     file_path = upload_dir / safe_name
     file_path.write_bytes(file_content)
 
+    # Read preview BEFORE writing the import record so a file-read error
+    # (corrupt CSV, permission issue) surfaces as a clean 400 rather than a
+    # half-created import.
+    preview = read_file_preview(str(file_path))
+
     data_import = DataImport(
         id=import_id,
         organization_id=organization_id,
@@ -153,6 +164,8 @@ async def create_import(
         file_type=file_type,
         raw_storage_path=str(file_path),
         status=ImportStatus.UPLOADED.value,
+        persisted_columns=json.dumps(preview["columns"]),
+        persisted_preview_rows=json.dumps(preview["preview_rows"]),
     )
     db.add(data_import)
     await db.flush()

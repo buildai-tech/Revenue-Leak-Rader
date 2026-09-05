@@ -245,6 +245,8 @@ export interface ImportPreview {
   filename: string;
   file_type: string;
   status: string;
+  /** Short, human-readable failure reason (present when status === 'failed'). */
+  error_message?: string | null;
   columns: string[];
   preview_rows: Record<string, any>[];
   row_count?: number;

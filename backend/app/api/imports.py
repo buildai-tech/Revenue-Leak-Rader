@@ -1,7 +1,9 @@
 """Import API — upload, preview, mapping, processing."""
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
 from sqlalchemy import select
@@ -20,6 +22,7 @@ from app.schemas.schemas import ImportPreview, ColumnMappingConfirm, ColumnMappi
 
 router = APIRouter(prefix="/api/imports", tags=["imports"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 def _org_id() -> uuid.UUID:
@@ -44,16 +47,14 @@ async def upload_file(
         db, _org_id(), file.filename, ext, content,
     )
 
-    preview = import_service.read_file_preview(data_import.raw_storage_path)
-
     return ImportPreview(
         id=str(data_import.id),
         filename=data_import.filename,
         file_type=data_import.file_type,
         status=data_import.status,
-        columns=preview["columns"],
-        preview_rows=preview["preview_rows"],
-        row_count=preview.get("total_preview_rows"),
+        columns=data_import.columns_list,
+        preview_rows=data_import.preview_rows_list,
+        row_count=len(data_import.preview_rows_list),
         created_at=data_import.created_at.isoformat() if data_import.created_at else None,
     )
 
@@ -97,14 +98,20 @@ async def get_import(import_id: str, db: AsyncSession = Depends(get_db)):
         "created_at": data_import.created_at.isoformat() if data_import.created_at else None,
     }
 
-    # Include preview if file exists
+    # Include preview — prefer persisted metadata (survives /tmp restart on Render)
+    # but try the raw file first if it still exists (freshest data).
+    preview = None
     try:
         preview = import_service.read_file_preview(data_import.raw_storage_path)
+    except Exception:
+        preview = None
+
+    if preview:
         response["columns"] = preview["columns"]
         response["preview_rows"] = preview["preview_rows"]
-    except Exception:
-        response["columns"] = []
-        response["preview_rows"] = []
+    else:
+        response["columns"] = data_import.columns_list
+        response["preview_rows"] = data_import.preview_rows_list
 
     # Include current mappings
     mappings_result = await db.execute(
@@ -132,18 +139,70 @@ async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get
     Phase 2: collision detection runs on the heuristic suggestions and the
     result is returned alongside them so the UI can show what was auto-selected
     and what was dropped.
+
+    Resilience (production incident 2026-09-05): the AI provider call is
+    best-effort. Any NVIDIA failure — missing SDK, invalid credentials,
+    outage, rate limit, malformed output — is logged (never the API key)
+    and the endpoint degrades to the deterministic heuristic suggestions
+    so a temporary AI failure can never fail an import.
     """
     data_import = await db.get(DataImport, uuid.UUID(import_id))
     if not data_import:
         raise HTTPException(404, "Import not found")
 
-    preview = import_service.read_file_preview(data_import.raw_storage_path)
-    source_columns = preview["columns"]
+    # A missing/unreadable raw file (e.g. ephemeral /tmp storage restart on
+    # Render) must not 500 — fall back to the persisted column/preview metadata
+    # that was captured at upload time.
+    preview = None
+    try:
+        preview = import_service.read_file_preview(data_import.raw_storage_path)
+    except Exception as exc:
+        logger.warning(
+            "Could not read stored preview file for import %s (%s: %s) — "
+            "falling back to persisted metadata",
+            import_id, type(exc).__name__, exc,
+        )
 
-    llm = get_llm_provider()
-    llm_suggestions = await llm.suggest_column_mappings(
-        source_columns, TARGET_FIELDS, preview["preview_rows"][:3],
-    )
+    if preview:
+        source_columns = preview["columns"]
+        sample_rows = preview["preview_rows"][:3]
+    else:
+        source_columns = data_import.columns_list
+        sample_rows = data_import.preview_rows_list[:3]
+
+    # If neither the raw file nor persisted preview metadata is available
+    # (e.g. an import uploaded before the persistence fix, then the server
+    # restarted), we cannot reconstruct the columns at all. Surface a clear,
+    # sanitized message — never a filesystem path or stack trace.
+    if not source_columns:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The source file for this import is no longer available on the "
+                "server, and no column metadata was persisted for it. Please "
+                "delete this batch and re-upload the CSV to continue."
+            ),
+        )
+
+    # Best-effort AI refinement — NVIDIA failures must never break imports.
+    # NOTE: the OpenAI SDK never includes the API key in exception messages.
+    from app.ai.llm_provider import NoOpLLMProvider
+    llm_suggestions: list[dict[str, Any]] = []
+    llm_provider_obj = get_llm_provider()
+    provider_is_noop = isinstance(llm_provider_obj, NoOpLLMProvider)
+
+    if not provider_is_noop:
+        try:
+            llm_suggestions = await llm_provider_obj.suggest_column_mappings(
+                source_columns, TARGET_FIELDS, sample_rows,
+            )
+        except Exception as exc:
+            logger.warning(
+                "AI column-mapping provider unavailable for import %s (%s: %s) — "
+                "falling back to heuristic suggestions",
+                import_id, type(exc).__name__, exc,
+            )
+            llm_suggestions = []
 
     # Phase 2: enforce one-target-one-source on EVERY source of suggestions.
     if llm_suggestions and not isinstance(llm_suggestions, list):
@@ -152,10 +211,14 @@ async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get
     heuristic_suggestions = mapping_result["suggestions"]
     collisions = mapping_result["collisions"]
 
+    # Track the provenance so the UI can report which source was used.
+    provider_error: str | None = None
+    mapping_source = "heuristic"
+
     # If the LLM returned structured suggestions (list of {source_column,
     # target_field}), use them — but still enforce collision resolution.
     chosen = heuristic_suggestions
-    if isinstance(llm_suggestions, list) and llm_suggestions:
+    if not provider_is_noop and isinstance(llm_suggestions, list) and llm_suggestions:
         try:
             selected = [
                 {
@@ -169,14 +232,22 @@ async def get_mapping_suggestions(import_id: str, db: AsyncSession = Depends(get
             ]
             if selected:
                 chosen = selected
+                mapping_source = "llm"
         except Exception:
             chosen = heuristic_suggestions
+            provider_error = "LLM response parsing failed"
+    elif provider_is_noop:
+        provider_error = "LLM not configured — using heuristic suggestions"
+    elif not llm_suggestions:
+        provider_error = "NVIDIA provider unavailable — using heuristic suggestions"
 
     errors = validate_no_collisions(chosen)
     return {
         "suggestions": chosen,
         "collisions": collisions,
         "target_fields": TARGET_FIELDS,
+        "source": mapping_source,
+        "provider_error": provider_error,
         "collision_errors": errors,
     }
 

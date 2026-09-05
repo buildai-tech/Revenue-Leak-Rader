@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     # NVIDIA NIM
     NVIDIA_API_KEY: str = ""
-    NVIDIA_MODEL: str = "meta/llama-3.1-70b-instruct"  # NVIDIA NIM catalog default
+    NVIDIA_MODEL: str = "nvidia/nemotron-3-super-120b-a12b"  # NVIDIA NIM hosted default (free endpoint)
 
     # ── Demo ──────────────────────────────────────────────────────────────
     DEMO_ORG_ID: str = "550e8400-e29b-41d4-a716-446655440000"

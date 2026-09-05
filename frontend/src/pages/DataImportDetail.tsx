@@ -10,10 +10,28 @@ import {
   Layers,
   ArrowRight,
   AlertCircle,
+  AlertTriangle,
   RotateCw,
 } from 'lucide-react';
 import { fetchApi, ImportPreview } from '../lib/api';
 import { StatusBadge } from '../components/ui/StatusBadge';
+
+/**
+ * Sanitize a backend error message for display: strip control characters
+ * that could mangle the layout and cap its length. The backend only stores
+ * short, human-readable messages (never stack traces or credentials), and
+ * React escapes text output by default.
+ */
+function sanitizeErrorMessage(raw?: string | null): string {
+  const msg = (raw || '')
+    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!msg) {
+    return 'The import could not be processed. Please try again or re-upload the file.';
+  }
+  return msg.length > 300 ? `${msg.slice(0, 300)}…` : msg;
+}
 
 const TARGET_FIELDS = [
   { key: 'name', label: 'Lead Full Name', required: true },
@@ -29,8 +47,10 @@ const TARGET_FIELDS = [
 ];
 
 interface SuggestionsResponse {
-  suggestions?: Array<{ source_column: string; target_field: string }>;
+  suggestions?: Array<{ source_column: string; target_field: string; confidence?: number; suggested_by?: string }>;
   target_fields?: string[];
+  source?: "llm" | "heuristic";
+  provider_error?: string | null;
 }
 
 export const DataImportDetail: React.FC = () => {
@@ -48,10 +68,11 @@ export const DataImportDetail: React.FC = () => {
     enabled: !!id,
   });
 
-  const { data: suggestionsData } = useQuery<SuggestionsResponse>({
+  const { data: suggestionsData, isError: suggestionsError } = useQuery<SuggestionsResponse>({
     queryKey: ['import-suggestions', id],
     queryFn: () => fetchApi(`/imports/${id}/suggestions`),
     enabled: !!id,
+    retry: false,
   });
 
   // Pre-fill mappings from suggestions or previous mappings
@@ -112,6 +133,18 @@ export const DataImportDetail: React.FC = () => {
           </div>
           <StatusBadge status={importData.status} />
         </div>
+
+        {importData.status === 'failed' && (
+          <div className="flex items-start gap-2 bg-rose-500/10 border border-rose-500/30 rounded-lg p-3">
+            <AlertCircle className="w-4 h-4 text-rose-400 mt-0.5 shrink-0" />
+            <div>
+              <p className="text-xs font-semibold text-rose-300">Import failed</p>
+              <p className="text-xs text-slate-300 break-words">
+                {sanitizeErrorMessage(importData.error_message)}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Stepper Progress Indicator */}
@@ -154,8 +187,36 @@ export const DataImportDetail: React.FC = () => {
               </div>
             </div>
 
+            {/* Show a clear message if suggestions could not be loaded at all
+                (e.g. original upload no longer available on the server). */}
+            {suggestionsError && (
+              <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 mb-4">
+                <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-xs font-semibold text-amber-300">Column suggestions could not be loaded</p>
+                  <p className="text-xs text-slate-400 break-words">
+                    The source file for this import may no longer be available on the server.
+                    Please delete this batch and re-upload the CSV to continue.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Show AI/heuristic provider status */}
+            {suggestionsData?.provider_error && (
+              <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 mb-4">
+                <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-xs font-semibold text-amber-300">Heuristic fallback active</p>
+                  <p className="text-xs text-slate-400 break-words">
+                    {sanitizeErrorMessage(suggestionsData.provider_error)}
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {importData.columns.map((col) => (
+              {importData?.columns?.map((col) => (
                 <div
                   key={col}
                   className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3.5 flex items-center justify-between gap-4"
@@ -239,6 +300,18 @@ export const DataImportDetail: React.FC = () => {
               Raw records normalized, identity resolved, and deterministic leakage rules evaluated.
             </p>
           </div>
+
+          {processingStats?.import_stats?.error && (
+            <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-left">
+              <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+              <div>
+                <p className="text-xs font-semibold text-amber-300">Pipeline finished with warnings</p>
+                <p className="text-xs text-slate-300 break-words">
+                  {sanitizeErrorMessage(String(processingStats.import_stats.error))}
+                </p>
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-3 gap-4 text-left">
             <div className="bg-slate-950 p-4 rounded-lg border border-slate-800">

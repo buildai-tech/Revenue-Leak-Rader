@@ -69,7 +69,7 @@ UPLOAD_DIR=/tmp/uploads
 CORS_ORIGINS=https://YOUR-APP.vercel.app
 LLM_PROVIDER=noop
 NVIDIA_API_KEY=
-NVIDIA_MODEL=meta/llama-3.1-70b-instruct
+NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b
 ```
 
 > **Note:** `PORT` is injected automatically by Render. Do not set it manually.
@@ -148,7 +148,7 @@ In Render environment variables:
 ```
 LLM_PROVIDER=nvidia
 NVIDIA_API_KEY=nvapi-YOUR-KEY-HERE
-NVIDIA_MODEL=meta/llama-3.1-70b-instruct
+NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b
 ```
 
 If `NVIDIA_API_KEY` is empty or invalid, the app gracefully falls back to the NoOp provider. **The app works correctly without AI.**

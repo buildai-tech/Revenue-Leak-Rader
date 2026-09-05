@@ -42,6 +42,20 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+        # Additive column alignment for pre-existing deployments.
+        # `create_all` only creates missing TABLES — it never adds columns to an
+        # existing table. These two nullable columns were introduced for the
+        # Render ephemeral-storage fix (2026-09-05) so persisted preview
+        # metadata can survive a /tmp restart. Idempotent + non-destructive.
+        await conn.exec_driver_sql(
+            "ALTER TABLE data_imports "
+            "ADD COLUMN IF NOT EXISTS persisted_columns TEXT"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE data_imports "
+            "ADD COLUMN IF NOT EXISTS persisted_preview_rows TEXT"
+        )
+
     # Ensure the demo organization exists BEFORE any dependent records are
     # created (Phase 17 — tenancy integrity, idempotent & non-destructive).
     from app.database import async_session_factory
