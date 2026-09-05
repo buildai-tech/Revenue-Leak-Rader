@@ -351,10 +351,10 @@ export const DataImport: React.FC = () => {
             <button
               type="button"
               onClick={() => setIsResetModalOpen(true)}
-              className="px-3 py-1.5 text-xs font-medium text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-lg transition-colors inline-flex items-center gap-1.5"
+              className="px-4 py-2 text-sm font-semibold text-rose-300 hover:text-white bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 hover:border-rose-500/50 rounded-lg transition-colors inline-flex items-center gap-2"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Clear Demo Data
+              <Trash2 className="w-4 h-4" />
+              Clear All Demo Data
             </button>
           )}
         </div>
@@ -477,14 +477,14 @@ export const DataImport: React.FC = () => {
                 <AlertTriangle className="w-5 h-5" />
               </div>
               <div>
-                <h4 className="text-base font-bold text-white">Clear All Imported Demo Data?</h4>
+                <h4 className="text-base font-bold text-white">Clear All Demo Data?</h4>
                 <p className="text-xs text-slate-400 mt-1">
-                  This will permanently remove all uploaded batches and their derived demo records for GreenVista Realty Demo. The demo organization and projects will remain intact.
+                  This will permanently delete all imported demo batches and their derived data.
+                </p>
+                <p className="text-xs text-slate-400 mt-1">
+                  Your organization, project, and baseline structure will remain.
                 </p>
               </div>
-            </div>
-            <div className="p-3 bg-amber-500/5 rounded-lg border border-amber-500/20 text-xs text-amber-300">
-              Note: This is a demo utility. Baseline organization setup and seed structures will NOT be deleted.
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -507,7 +507,7 @@ export const DataImport: React.FC = () => {
                     Clearing...
                   </>
                 ) : (
-                  'Clear Demo Data'
+                  'Clear All Data'
                 )}
               </button>
             </div>
