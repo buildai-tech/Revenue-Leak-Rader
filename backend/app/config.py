@@ -8,6 +8,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -78,6 +79,48 @@ class Settings(BaseSettings):
     # PORT is injected automatically by Render and other PaaS providers.
     # Leave unset for local development (uvicorn default: 8000).
     PORT: int = 8000
+
+    @model_validator(mode="after")
+    def _normalise_database_urls(self) -> "Settings":
+        """
+        Render (and most PaaS providers) inject a plain ``postgresql://`` or
+        ``postgres://`` DATABASE_URL.  SQLAlchemy's async engine requires the
+        ``+asyncpg`` driver suffix.  This validator rewrites the URL
+        transparently so the app starts correctly on Render without any manual
+        environment-variable tweaking.
+
+        Rules
+        -----
+        * DATABASE_URL      → always uses ``postgresql+asyncpg://``  (async engine)
+        * DATABASE_URL_SYNC → always uses ``postgresql://``            (Alembic / psycopg2)
+        * SQLite URLs are left untouched.
+        """
+        _ASYNC_PREFIX = "postgresql+asyncpg://"
+        _SYNC_PREFIX  = "postgresql://"
+
+        # Normalise DATABASE_URL → async driver
+        url = self.DATABASE_URL
+        if url.startswith(("postgres://", "postgresql://")):
+            # Strip any existing scheme (e.g. "postgres://", "postgresql://")
+            rest = url.split("://", 1)[1]
+            self.DATABASE_URL = _ASYNC_PREFIX + rest
+        elif url.startswith("postgresql+asyncpg://"):
+            pass  # already correct
+        # sqlite+aiosqlite:// — leave as-is
+
+        # Normalise DATABASE_URL_SYNC → sync psycopg2 driver
+        sync_url = self.DATABASE_URL_SYNC
+        if sync_url.startswith(("postgres://", "postgresql://")):
+            rest = sync_url.split("://", 1)[1]
+            self.DATABASE_URL_SYNC = _SYNC_PREFIX + rest
+        elif sync_url.startswith("postgresql+asyncpg://"):
+            # If someone accidentally put the async URL in DATABASE_URL_SYNC,
+            # strip it back to the sync driver for Alembic compatibility.
+            rest = sync_url.split("://", 1)[1]
+            self.DATABASE_URL_SYNC = _SYNC_PREFIX + rest
+        # sqlite:// — leave as-is
+
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:
