@@ -6,6 +6,8 @@ import { fetchApi, ImportPreview } from '../lib/api';
 import { formatDate } from '../lib/formatters';
 import { StatusBadge } from '../components/ui/StatusBadge';
 
+const API_BASE = (import.meta.env.VITE_API_URL as string) || '/api';
+
 const ALLOWED_EXTENSIONS = ['csv', 'xls', 'xlsx'];
 
 const ALLOWED_MIME_TYPES = new Set([
@@ -126,7 +128,7 @@ export const DataImport: React.FC = () => {
     formData.append('file', file);
 
     try {
-      const response = await fetch('/api/imports/upload', {
+      const response = await fetch(`${API_BASE}/imports/upload`, {
         method: 'POST',
         body: formData,
       });
