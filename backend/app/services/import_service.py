@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select, func
+from fastapi import HTTPException
+from sqlalchemy import select, func, delete, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -29,6 +30,13 @@ from app.models.lead_event import LeadEvent
 from app.models.project import Project
 from app.models.sales_rep import SalesRep
 from app.models.column_mapping import ColumnMapping
+from app.models.leakage_event import LeakageEvent
+from app.models.leakage_evidence import LeakageEvidence
+from app.models.financial_calculation import FinancialCalculation
+from app.models.recommendation import Recommendation
+from app.models.intervention import Intervention
+from app.models.recovery_outcome import RecoveryOutcome
+from app.models.identity_merge_log import IdentityMergeLog
 from app.models.background_job import BackgroundJob
 from app.models.enums import ImportStatus, JobStatus
 from app.core.normalization.phone import normalize_phone, normalize_email
@@ -442,3 +450,201 @@ async def process_import(
     )
 
     return stats
+
+
+async def delete_import(
+    db: AsyncSession,
+    import_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Permanently delete an imported batch and clean up its derived records.
+
+    Preserves referential integrity by safely removing records in reverse
+    dependency order:
+      1. Unlink leads merged into leads of this batch (merged_into_lead_id = None)
+      2. Delete identity merge logs referencing this batch's leads
+      3. Delete recovery outcomes, interventions, recommendations,
+         calculations & evidence for leakage events tied to this batch's leads
+      4. Delete leakage events tied to this batch's leads
+      5. Delete lead lifecycle events tied to this batch's leads
+      6. Delete leads created from this import
+      7. Delete column mappings for this import
+      8. Delete the DataImport record itself
+      9. Clean up raw storage files/directory on disk
+      10. Audit log the deletion
+    """
+    stmt = select(DataImport).where(DataImport.id == import_id)
+    res = await db.execute(stmt)
+    data_import = res.scalar_one_or_none()
+    if not data_import:
+        raise HTTPException(status_code=404, detail="Import batch not found")
+    if data_import.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Forbidden: batch belongs to another organization")
+
+    # 1. Find all lead IDs created by this import
+    leads_res = await db.execute(
+        select(Lead.id).where(Lead.created_from_import_id == import_id)
+    )
+    lead_ids = [row[0] for row in leads_res.all()]
+
+    deleted_leakage_count = 0
+    if lead_ids:
+        # 1a. Unlink any other leads that were merged into these leads
+        await db.execute(
+            update(Lead)
+            .where(Lead.merged_into_lead_id.in_(lead_ids))
+            .values(merged_into_lead_id=None)
+        )
+
+        # 1b. Delete identity merge logs referencing these leads
+        await db.execute(
+            delete(IdentityMergeLog).where(
+                or_(
+                    IdentityMergeLog.primary_lead_id.in_(lead_ids),
+                    IdentityMergeLog.merged_lead_id.in_(lead_ids),
+                )
+            )
+        )
+
+        # 1c. Find leakage events tied to these leads
+        leakage_res = await db.execute(
+            select(LeakageEvent.id).where(
+                LeakageEvent.source_entity_type == "lead",
+                LeakageEvent.source_entity_id.in_(lead_ids),
+            )
+        )
+        leakage_ids = [row[0] for row in leakage_res.all()]
+        deleted_leakage_count = len(leakage_ids)
+
+        if leakage_ids:
+            # Find recommendations tied to these leakage events
+            rec_res = await db.execute(
+                select(Recommendation.id).where(
+                    Recommendation.leakage_event_id.in_(leakage_ids)
+                )
+            )
+            rec_ids = [row[0] for row in rec_res.all()]
+
+            if rec_ids:
+                # Find interventions tied to these recommendations
+                int_res = await db.execute(
+                    select(Intervention.id).where(
+                        Intervention.recommendation_id.in_(rec_ids)
+                    )
+                )
+                int_ids = [row[0] for row in int_res.all()]
+
+                if int_ids:
+                    # Delete recovery outcomes
+                    await db.execute(
+                        delete(RecoveryOutcome).where(RecoveryOutcome.intervention_id.in_(int_ids))
+                    )
+                    # Delete interventions
+                    await db.execute(
+                        delete(Intervention).where(Intervention.id.in_(int_ids))
+                    )
+
+                # Delete recommendations
+                await db.execute(
+                    delete(Recommendation).where(Recommendation.id.in_(rec_ids))
+                )
+
+            # Delete leakage evidence and financial calculations
+            await db.execute(
+                delete(LeakageEvidence).where(LeakageEvidence.leakage_event_id.in_(leakage_ids))
+            )
+            await db.execute(
+                delete(FinancialCalculation).where(FinancialCalculation.leakage_event_id.in_(leakage_ids))
+            )
+
+            # Delete leakage events
+            await db.execute(
+                delete(LeakageEvent).where(LeakageEvent.id.in_(leakage_ids))
+            )
+
+        # 1d. Delete lead lifecycle events
+        await db.execute(
+            delete(LeadEvent).where(LeadEvent.lead_id.in_(lead_ids))
+        )
+
+        # 1e. Delete leads
+        await db.execute(
+            delete(Lead).where(Lead.id.in_(lead_ids))
+        )
+
+    # 2. Delete column mappings
+    await db.execute(
+        delete(ColumnMapping).where(ColumnMapping.import_id == import_id)
+    )
+
+    # 3. Delete the DataImport record
+    filename = data_import.filename
+    raw_storage_path = data_import.raw_storage_path
+    await db.delete(data_import)
+    await db.flush()
+
+    # 4. Safe file storage cleanup
+    if raw_storage_path:
+        try:
+            file_p = Path(raw_storage_path)
+            if file_p.exists():
+                file_p.unlink()
+            parent_dir = file_p.parent
+            if parent_dir.name == str(import_id) and parent_dir.exists():
+                import shutil
+                shutil.rmtree(parent_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning("Could not delete storage file %s: %s", raw_storage_path, e)
+
+    # 5. Audit log
+    await log_action(
+        db,
+        "import_deleted",
+        "data_import",
+        str(import_id),
+        before={"filename": filename, "leads_count": len(lead_ids)},
+    )
+
+    return {
+        "status": "deleted",
+        "import_id": str(import_id),
+        "filename": filename,
+        "deleted_leads": len(lead_ids),
+        "deleted_leakage_events": deleted_leakage_count,
+    }
+
+
+async def clear_organization_imports(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Delete all imported batches and their derived records for an organization.
+
+    Preserves the organization, sales reps, projects, and base schema.
+    """
+    stmt = select(DataImport.id).where(DataImport.organization_id == organization_id)
+    res = await db.execute(stmt)
+    import_ids = [row[0] for row in res.all()]
+
+    total_deleted_leads = 0
+    total_deleted_leakage = 0
+    for imp_id in import_ids:
+        del_res = await delete_import(db, imp_id, organization_id)
+        total_deleted_leads += del_res.get("deleted_leads", 0)
+        total_deleted_leakage += del_res.get("deleted_leakage_events", 0)
+
+    await log_action(
+        db,
+        "all_imports_cleared",
+        "organization",
+        str(organization_id),
+        before={"batches_count": len(import_ids), "leads_count": total_deleted_leads},
+    )
+
+    return {
+        "status": "cleared",
+        "deleted_batches": len(import_ids),
+        "deleted_leads": total_deleted_leads,
+        "deleted_leakage_events": total_deleted_leakage,
+    }
+

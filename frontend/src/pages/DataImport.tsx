@@ -1,8 +1,8 @@
 import React, { useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { UploadCloud, FileSpreadsheet, ArrowRight, CheckCircle2, Clock } from 'lucide-react';
-import { fetchApi, ImportPreview } from '../lib/api';
+import { UploadCloud, FileSpreadsheet, ArrowRight, CheckCircle2, Clock, Trash2, AlertTriangle, RefreshCw, X } from 'lucide-react';
+import { fetchApi, ImportPreview, deleteImport, clearDemoImports } from '../lib/api';
 import { formatDate } from '../lib/formatters';
 import { StatusBadge } from '../components/ui/StatusBadge';
 
@@ -63,10 +63,73 @@ export const DataImport: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
 
+  // Deletion & reset states
+  const [batchToDelete, setBatchToDelete] = useState<ImportPreview | null>(null);
+  const [isResetModalOpen, setIsResetModalOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [actionNotification, setActionNotification] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+
   const { data: imports = [], isLoading } = useQuery<ImportPreview[]>({
     queryKey: ['imports-list'],
     queryFn: () => fetchApi('/imports'),
   });
+
+  const invalidateAll = () => {
+    queryClient.invalidateQueries({ queryKey: ['imports-list'] });
+    queryClient.invalidateQueries({ queryKey: ['imports'] });
+    queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['leads'] });
+    queryClient.invalidateQueries({ queryKey: ['leakage'] });
+    queryClient.invalidateQueries({ queryKey: ['recommendations'] });
+    queryClient.invalidateQueries({ queryKey: ['interventions'] });
+    queryClient.invalidateQueries({ queryKey: ['reports'] });
+  };
+
+  const handleDeleteBatch = async () => {
+    if (!batchToDelete) return;
+    setIsDeleting(true);
+    setActionNotification(null);
+    try {
+      const res = await deleteImport(batchToDelete.id);
+      setActionNotification({
+        type: 'success',
+        message: `Batch "${batchToDelete.filename}" deleted permanently (${res.deleted_leads || 0} leads and derived records removed).`,
+      });
+      setBatchToDelete(null);
+      invalidateAll();
+    } catch (err: any) {
+      setActionNotification({
+        type: 'error',
+        message: err?.message || 'Failed to delete imported batch.',
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleClearAllImports = async () => {
+    setIsDeleting(true);
+    setActionNotification(null);
+    try {
+      const res = await clearDemoImports();
+      setActionNotification({
+        type: 'success',
+        message: `All imported demo data cleared permanently (${res.deleted_batches || 0} batches, ${res.deleted_leads || 0} leads removed).`,
+      });
+      setIsResetModalOpen(false);
+      invalidateAll();
+    } catch (err: any) {
+      setActionNotification({
+        type: 'error',
+        message: err?.message || 'Failed to clear imported demo data.',
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   const handleFileSelected = (selected: File | null): void => {
     // No file selected (e.g. the picker was cancelled) → keep current state untouched
@@ -245,11 +308,56 @@ export const DataImport: React.FC = () => {
         </form>
       </div>
 
+      {/* Action Notification Toast/Banner */}
+      {actionNotification && (
+        <div
+          className={`p-4 rounded-xl border flex items-center justify-between text-xs font-medium animate-in fade-in ${
+            actionNotification.type === 'success'
+              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+              : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {actionNotification.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            )}
+            <span>{actionNotification.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionNotification(null)}
+            className="p-1 hover:opacity-75 transition-opacity"
+            title="Dismiss"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Historical Imports Table */}
       <div className="bg-[#0f172a]/90 border border-slate-800 rounded-xl p-6 space-y-4">
-        <h3 className="text-sm font-bold text-white uppercase tracking-wider">
-          Batch Ingestion History
-        </h3>
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+              Batch Ingestion History
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Historical CSV and XLSX files processed into the revenue engine.
+            </p>
+          </div>
+          {imports.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setIsResetModalOpen(true)}
+              className="px-3 py-1.5 text-xs font-medium text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-lg transition-colors inline-flex items-center gap-1.5"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Clear Demo Data
+            </button>
+          )}
+        </div>
 
         <div className="overflow-x-auto rounded-lg border border-slate-800">
           <table className="w-full text-left text-xs border-collapse">
@@ -283,9 +391,22 @@ export const DataImport: React.FC = () => {
                     <td className="py-3.5 px-4 font-mono">{item.row_count || '—'}</td>
                     <td className="py-3.5 px-4 text-slate-400">{formatDate(item.created_at)}</td>
                     <td className="py-3.5 px-4 text-right">
-                      <span className="text-xs font-semibold text-blue-400 hover:underline inline-flex items-center gap-1">
-                        Inspect Stepper <ArrowRight className="w-3.5 h-3.5" />
-                      </span>
+                      <div className="inline-flex items-center gap-2">
+                        <span className="text-xs font-semibold text-blue-400 hover:underline inline-flex items-center gap-1">
+                          Inspect Stepper <ArrowRight className="w-3.5 h-3.5" />
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setBatchToDelete(item);
+                          }}
+                          title="Delete this batch"
+                          className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 rounded-md transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -294,6 +415,105 @@ export const DataImport: React.FC = () => {
           </table>
         </div>
       </div>
+
+      {/* Delete Batch Confirmation Dialog */}
+      {batchToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-[#0f172a] border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-base font-bold text-white">Delete this imported batch?</h4>
+                <p className="text-xs text-slate-400 mt-1">
+                  This will permanently remove <span className="font-semibold text-slate-200">"{batchToDelete.filename}"</span> and its related demo records, leads, and derived leakage events.
+                </p>
+              </div>
+            </div>
+            <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800 text-xs text-slate-400 space-y-1 font-mono">
+              <div>Batch: <span className="text-slate-200">{batchToDelete.filename}</span></div>
+              <div>Type: <span className="text-slate-200 uppercase">{batchToDelete.file_type}</span></div>
+              <div>Rows: <span className="text-slate-200">{batchToDelete.row_count ?? 'N/A'}</span></div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setBatchToDelete(null)}
+                className="px-4 py-2 text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={handleDeleteBatch}
+                className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 rounded-lg transition-colors shadow-lg shadow-rose-600/20 flex items-center gap-1.5"
+              >
+                {isDeleting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Delete Batch
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Demo Data Confirmation Dialog */}
+      {isResetModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-[#0f172a] border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-base font-bold text-white">Clear All Imported Demo Data?</h4>
+                <p className="text-xs text-slate-400 mt-1">
+                  This will permanently remove all uploaded batches and their derived demo records for GreenVista Realty Demo. The demo organization and projects will remain intact.
+                </p>
+              </div>
+            </div>
+            <div className="p-3 bg-amber-500/5 rounded-lg border border-amber-500/20 text-xs text-amber-300">
+              Note: This is a demo utility. Baseline organization setup and seed structures will NOT be deleted.
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setIsResetModalOpen(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={handleClearAllImports}
+                className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 rounded-lg transition-colors shadow-lg shadow-rose-600/20 flex items-center gap-1.5"
+              >
+                {isDeleting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Clearing...
+                  </>
+                ) : (
+                  'Clear Demo Data'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

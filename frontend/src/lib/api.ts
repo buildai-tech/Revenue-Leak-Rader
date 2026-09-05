@@ -33,6 +33,25 @@ export async function fetchApi<T>(endpoint: string, options?: RequestInit): Prom
   return response.json();
 }
 
+export async function deleteImport(importId: string): Promise<{
+  status: string;
+  import_id: string;
+  filename: string;
+  deleted_leads: number;
+  deleted_leakage_events: number;
+}> {
+  return fetchApi(`/imports/${importId}`, { method: 'DELETE' });
+}
+
+export async function clearDemoImports(): Promise<{
+  status: string;
+  deleted_batches: number;
+  deleted_leads: number;
+  deleted_leakage_events: number;
+}> {
+  return fetchApi('/imports/demo/clear', { method: 'DELETE' });
+}
+
 // ── Types ─────────────────────────────────────────────────────────────
 
 export interface DashboardSummary {

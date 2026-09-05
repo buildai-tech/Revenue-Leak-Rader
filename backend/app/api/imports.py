@@ -250,3 +250,29 @@ async def confirm_mappings(
         "merge_stats": merge_stats,
         "leakage_stats": leakage_stats,
     }
+
+
+@router.delete("/{import_id}")
+async def delete_import_batch(
+    import_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an imported batch and safely clean up all derived records."""
+    try:
+        parsed_id = uuid.UUID(import_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid import ID format")
+
+    result = await import_service.delete_import(db, parsed_id, _org_id())
+    return result
+
+
+@router.post("/reset")
+@router.delete("/demo/clear")
+async def clear_demo_imports(
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear all imported demo batches and derived records for the demo organization."""
+    result = await import_service.clear_organization_imports(db, _org_id())
+    return result
+
