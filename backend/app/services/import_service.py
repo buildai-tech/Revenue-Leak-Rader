@@ -49,8 +49,10 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def _as_utc(dt: datetime) -> datetime:
+def _as_utc(dt: datetime | None) -> datetime | None:
     """Normalize a parsed datetime to timezone-aware UTC (SQLite-safe)."""
+    if dt is None:
+        return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
