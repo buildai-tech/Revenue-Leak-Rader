@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.config import get_settings
 from app.models.data_import import DataImport
+from app.models.background_job import BackgroundJob
 from app.models.column_mapping import ColumnMapping
-from app.models.enums import ImportStatus
+from app.models.enums import ImportStatus, JobStatus
 from app.services import import_service
 from app.services.audit_service import log_action
 from app.ai.llm_provider import get_llm_provider
@@ -315,7 +316,14 @@ async def confirm_mappings(
     body: ColumnMappingConfirm,
     db: AsyncSession = Depends(get_db),
 ):
-    """Confirm column mappings and trigger processing."""
+    """Confirm column mappings and enqueue the processing pipeline.
+
+    The pipeline now runs as a background job (see app/services/import_job.py):
+    this endpoint persists the confirmed mappings, marks the import as
+    ``processing``, enqueues a ``background_jobs`` row, and returns
+    immediately. The browser never has to stay open — poll
+    ``GET /imports/{id}/processing`` for progress.
+    """
     data_import = await db.get(DataImport, uuid.UUID(import_id))
     if not data_import:
         raise HTTPException(404, "Import not found")
@@ -359,24 +367,75 @@ async def confirm_mappings(
         after={"mappings_count": len(body.mappings)},
     )
 
-    # Process the import
-    data_import.status = ImportStatus.MAPPING.value
+    # Enqueue the pipeline as a background job (never on the response path).
+    data_import.status = ImportStatus.PROCESSING.value
+    job = BackgroundJob(
+        job_type="import_process",
+        payload={"import_id": str(data_import.id)},
+    )
+    db.add(job)
     await db.flush()
 
-    stats = await import_service.process_import(db, data_import.id, org_id)
+    return {
+        "job_id": str(job.id),
+        "import_id": str(data_import.id),
+        "status": job.status,
+        "message": "Import processing started in the background",
+    }
 
-    # Run identity resolution
-    from app.core.identity.resolver import resolve_identities
-    merge_stats = await resolve_identities(db, org_id)
 
-    # Run leakage detection
-    from app.services.leakage_service import detect_leakage_for_organization
-    leakage_stats = await detect_leakage_for_organization(db, org_id)
+@router.get("/{import_id}/processing")
+async def get_import_processing(
+    import_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the status/progress of the import's background pipeline job.
+
+    The frontend polls this endpoint while ``status`` is pending/running.
+    Once completed, ``stats`` carries the import/merge/leakage results.
+    """
+    data_import = await db.get(DataImport, uuid.UUID(import_id))
+    if not data_import:
+        raise HTTPException(404, "Import not found")
+
+    jobs = (await db.execute(
+        select(BackgroundJob)
+        .where(BackgroundJob.job_type == "import_process")
+        .order_by(BackgroundJob.created_at.desc())
+    )).scalars().all()
+    job = next(
+        (j for j in jobs if (j.payload or {}).get("import_id") == str(import_id)),
+        None,
+    )
+
+    if job is None:
+        return {
+            "job_id": None,
+            "status": "none",
+            "import_status": data_import.status,
+            "progress": {},
+            "error": None,
+            "stats": None,
+        }
+
+    payload = job.payload or {}
+    stats = {
+        "import_stats": payload.get("import_stats"),
+        "merge_stats": payload.get("merge_stats"),
+        "leakage_stats": payload.get("leakage_stats"),
+    } if payload.get("stage") == "done" or job.status == JobStatus.COMPLETED.value else None
 
     return {
-        "import_stats": stats,
-        "merge_stats": merge_stats,
-        "leakage_stats": leakage_stats,
+        "job_id": str(job.id),
+        "status": job.status,
+        "import_status": data_import.status,
+        "stage": payload.get("stage"),
+        "processed_rows": payload.get("processed_rows", 0),
+        "total_rows": payload.get("total_rows", data_import.row_count or 0),
+        "leads_created": payload.get("leads_created", 0),
+        "errors": payload.get("errors", 0),
+        "error": job.error,
+        "stats": stats,
     }
 
 

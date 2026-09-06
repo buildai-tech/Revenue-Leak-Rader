@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import uuid
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -352,35 +353,174 @@ async def detect_leakage_for_organization(
     The response-SLA benchmark is computed once per run and shared by every
     lead (empirical P75 when the sample allows, otherwise the configured
     fallback — the source is recorded either way).
+
+    Batched performance path: leads are processed in chunks with the per-lead
+    queries (events, existing active categories, sales rep) replaced by a few
+    ``WHERE id IN (chunk)`` lookups, and all created leakage rows are flushed
+    once per chunk. Output statistics are identical to the original per-lead
+    implementation.
     """
     result = await db.execute(
-        select(Lead).where(
+        select(Lead.id).where(
             Lead.organization_id == organization_id,
             Lead.merged_into_lead_id.is_(None),
         )
     )
-    leads = list(result.scalars().all())
+    lead_ids = [row[0] for row in result.all()]
+
+    # One query each: sales reps snapshot + SLA benchmark.
+    reps = {
+        r.id: r
+        for r in (await db.execute(
+            select(SalesRep).where(SalesRep.organization_id == organization_id)
+        )).scalars().all()
+    }
 
     sla_minutes, sla_source, sla_info = await compute_empirical_sla(db, organization_id)
     thresholds = _default_thresholds()
+    now = datetime.now(timezone.utc)
 
     stats = {
-        "total_leads": len(leads),
+        "total_leads": len(lead_ids),
         "leads_with_leakage": 0,
         "total_events": 0,
         "deduplicated_skips": 0,
         "sla_benchmark": sla_info,
     }
 
-    for lead in leads:
-        detection = await detect_leakage_for_lead(
-            db, lead, organization_id, data_source,
-            thresholds=thresholds, sla_minutes=sla_minutes, sla_source=sla_source,
-        )
-        if detection["rules_triggered"] > 0:
-            stats["leads_with_leakage"] += 1
-        stats["total_events"] += detection["leakage_events_created"]
-        stats["deduplicated_skips"] += detection["rules_deduplicated"]
+    BATCH = 500
+    for start in range(0, len(lead_ids), BATCH):
+        chunk_ids = lead_ids[start:start + BATCH]
+
+        leads = list((
+            await db.execute(select(Lead).where(Lead.id.in_(chunk_ids)))
+        ).scalars().all())
+
+        events_by_lead: dict[uuid.UUID, list[LeadEvent]] = defaultdict(list)
+        for ev in (await db.execute(
+            select(LeadEvent).where(LeadEvent.lead_id.in_(chunk_ids))
+        )).scalars().all():
+            events_by_lead[ev.lead_id].append(ev)
+
+        cats_by_lead: dict[uuid.UUID, set[str]] = defaultdict(set)
+        for src_id, category in (await db.execute(
+            select(LeakageEvent.source_entity_id, LeakageEvent.category).where(
+                LeakageEvent.source_entity_type == "lead",
+                LeakageEvent.source_entity_id.in_(chunk_ids),
+                LeakageEvent.status.in_(_ACTIVE_LEAK_STATUSES),
+            )
+        )).all():
+            cats_by_lead[src_id].add(category)
+
+        for lead in leads:
+            events = events_by_lead.get(lead.id, [])
+            rep = reps.get(lead.sales_rep_id) if lead.sales_rep_id else None
+
+            # ── Refresh derived fields if the lead predates them ────────────
+            if lead.is_dark_lead is None and lead.created_at is not None:
+                derived = compute_derived_fields(
+                    created_at=lead.created_at,
+                    first_contact_at=lead.first_contact_at,
+                    last_contact_at=lead.last_followup_at,
+                    site_visit_at=lead.site_visit_at,
+                    negotiation_at=lead.negotiation_at,
+                    closed_at=lead.closed_at,
+                    total_touches=lead.total_touches,
+                    now=now,
+                )
+                lead.response_latency_minutes = derived.response_latency_minutes
+                lead.site_visit_latency_days = derived.site_visit_latency_days
+                lead.sales_cycle_days = derived.sales_cycle_days
+                lead.is_dark_lead = derived.is_dark_lead
+                lead.is_single_touch = derived.is_single_touch
+                lead.funnel_max_stage = derived.funnel_max_stage
+                if derived.data_quality_flags:
+                    lead.data_quality_flags = derived.to_flags_dict()
+
+            # ── Detectors (identical to detect_leakage_for_lead) ────────────
+            funnel_lead = _build_funnel_lead_data(lead, events)
+            candidates = evaluate_funnel_leaks(
+                funnel_lead,
+                now=now,
+                thresholds=thresholds,
+                sla_minutes=sla_minutes,
+                sla_source=sla_source,
+            )
+
+            lead_data = _build_lead_data(lead, events, rep)
+            legacy_results = evaluate_all_rules(lead_data, now=now)
+
+            all_results: list[RuleResult] = [_candidate_to_result(c) for c in candidates]
+            all_results.extend(legacy_results)
+            triggered = [r for r in all_results if r.triggered]
+
+            already_tracked = cats_by_lead.get(lead.id, set())
+            new_results = [r for r in triggered if r.rule not in already_tracked]
+
+            recovery_score = calculate_recovery_score(all_results)
+            confidence = calculate_lead_confidence(
+                has_phone=bool(lead.phone_normalized),
+                has_email=bool(lead.email),
+                has_budget=bool(lead.budget and lead.budget > 0),
+                has_project=bool(lead.project_id),
+                has_sales_rep=bool(lead.sales_rep_id),
+                has_events=len(events) > 0,
+                event_count=len(events),
+            )
+
+            detector_ids = {c.category: c.detector_id for c in candidates}
+            severities = {c.category: c.severity for c in candidates}
+
+            for rule_result in new_results:
+                leakage_event = LeakageEvent(
+                    id=uuid.uuid4(),
+                    organization_id=organization_id,
+                    category=rule_result.rule,
+                    source_entity_type="lead",
+                    source_entity_id=lead.id,
+                    tier=Tier.MODEL_PREDICTION.value,
+                    title=_generate_title(rule_result.rule, lead),
+                    status="open",
+                    detector_id=detector_ids.get(rule_result.rule),
+                    severity=severities.get(rule_result.rule),
+                )
+                db.add(leakage_event)
+
+                for ev in rule_result.evidence:
+                    db.add(LeakageEvidence(
+                        organization_id=organization_id,
+                        leakage_event_id=leakage_event.id,
+                        evidence_type=ev.get("type", "unknown"),
+                        evidence_payload=ev,
+                    ))
+
+                if lead.budget and lead.budget > 0:
+                    financial_result = lead_exposure_v2(
+                        deal_value_inr=lead.budget,
+                        commission_rate=lead.commission_rate,
+                        confidence=confidence,
+                        data_source=data_source,
+                    )
+                    db.add(FinancialCalculation(
+                        organization_id=organization_id,
+                        leakage_event_id=leakage_event.id,
+                        tier=financial_result.tier.value,
+                        amount_inr=financial_result.amount_inr,
+                        confidence=financial_result.confidence,
+                        formula_id=financial_result.formula_id,
+                        formula_version=financial_result.formula_version,
+                        assumptions=financial_result.assumptions,
+                        data_source=financial_result.data_source,
+                    ))
+
+            if triggered:
+                stats["leads_with_leakage"] += 1
+            stats["total_events"] += len(new_results)
+            stats["deduplicated_skips"] += len(triggered) - len(new_results)
+
+        # One flush per chunk + free the identity map → bounded memory.
+        await db.flush()
+        db.expunge_all()
 
     return stats
 

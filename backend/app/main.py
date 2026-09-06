@@ -64,13 +64,33 @@ async def lifespan(app: FastAPI):
         await ensure_demo_organization(session)
         await session.commit()
 
+    # Resume/clean any import job killed by a previous restart.
+    from app.services.import_job import mark_startup_interrupted_jobs
+    await mark_startup_interrupted_jobs()
+
+    # Start the import-pipeline background worker. It shares this process's
+    # event loop (single uvicorn worker) and is cancelled on shutdown; status
+    # + progress are persisted to the background_jobs table for polling.
+    import asyncio
+    from app.services.import_job import run_import_worker
+    import_worker_stop = asyncio.Event()
+    import_worker_task = asyncio.create_task(run_import_worker(import_worker_stop))
+
     logger.info(
         "Revenue Leak Radar starting — env=%s db=%s",
         settings.APP_ENV,
         "sqlite" if "sqlite" in settings.DATABASE_URL else "postgresql",
     )
-    yield
-    logger.info("Revenue Leak Radar shutting down")
+    try:
+        yield
+    finally:
+        import_worker_stop.set()
+        import_worker_task.cancel()
+        try:
+            await import_worker_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Revenue Leak Radar shutting down")
 
 
 # ── App ───────────────────────────────────────────────────────────────────

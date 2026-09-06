@@ -21,7 +21,7 @@ from typing import Any
 
 import pandas as pd
 from fastapi import HTTPException
-from sqlalchemy import select, func, delete, update, or_
+from sqlalchemy import insert, select, func, delete, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -39,6 +39,7 @@ from app.models.intervention import Intervention
 from app.models.recovery_outcome import RecoveryOutcome
 from app.models.identity_merge_log import IdentityMergeLog
 from app.models.background_job import BackgroundJob
+from app.models.timestamps import utc_now
 from app.models.enums import ImportStatus, JobStatus
 from app.core.normalization.phone import normalize_phone, normalize_email
 from app.core.normalization.dates import parse_date, normalize_status
@@ -258,14 +259,59 @@ async def get_or_create_sales_rep(
     return new_rep.id
 
 
+async def _name_to_id(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    name: str | None,
+    model: type[Project] | type[SalesRep],
+    cache: dict[str, uuid.UUID],
+) -> uuid.UUID | None:
+    """Resolve a project/rep name to its id, caching lookups per import run.
+
+    Name → id resolution is read-heavy (the same handful of project/rep names
+    repeats across thousands of rows). A verified SELECT keyed by name happens
+    at most once per unique name per run; missing names create + flush once.
+    """
+    if not name or not name.strip():
+        return None
+    key = name.strip()
+    if key in cache:
+        return cache[key]
+
+    row = (await db.execute(
+        select(model.id).where(
+            model.organization_id == organization_id,
+            model.name == key,
+        )
+    )).scalars().first()
+    if row is not None:
+        cache[key] = row
+        return row
+
+    new_obj = model(organization_id=organization_id, name=key)
+    db.add(new_obj)
+    await db.flush()
+    cache[key] = new_obj.id
+    return new_obj.id
+
+
 async def process_import(
     db: AsyncSession,
     import_id: uuid.UUID,
     organization_id: uuid.UUID,
+    *,
+    batch_size: int = 500,
+    on_progress: Any = None,  # async callable(batched_rows, stats) after each flush
 ) -> dict[str, Any]:
     """Process a confirmed import — normalize, create leads, create events.
 
-    Returns processing statistics.
+    Bulk path: project/rep name lookups are cached per run, and leads +
+    lifecycle events are inserted as single-multi-row statements per batch
+    (core ``Insert`` executemany) instead of one awaited flush per row. Row
+    normalization + deterministic derived fields are unchanged — this is a
+    pure performance refactor with identical output.
+
+    Returns processing statistics (same shape as before).
     """
     data_import = await db.get(DataImport, import_id)
     if not data_import:
@@ -322,6 +368,14 @@ async def process_import(
 
     ingest_now = datetime.now(timezone.utc)
 
+    # Per-import caches: repeated project/rep names are resolved from memory,
+    # never via a fresh query per row.
+    project_cache: dict[str, uuid.UUID] = {}
+    rep_cache: dict[str, uuid.UUID] = {}
+
+    lead_rows: list[dict[str, Any]] = []
+    event_rows: list[dict[str, Any]] = []
+
     for _, row in df.iterrows():
         try:
             # Map columns to target fields
@@ -366,12 +420,14 @@ async def process_import(
             commission_rate = _parse_commission_rate(mapped.get("commission_rate", ""))
             total_touches = _parse_int(mapped.get("total_touches", ""))
 
-            # ── Get or create project/rep ────────────────────────────────────
-            project_id = await get_or_create_project(
-                db, organization_id, mapped.get("project_name", "")
+            # ── Get or create project/rep (cached per import run) ───────────
+            project_id = await _name_to_id(
+                db, organization_id, mapped.get("project_name", ""),
+                Project, project_cache,
             )
-            sales_rep_id = await get_or_create_sales_rep(
-                db, organization_id, mapped.get("sales_rep_name", "")
+            sales_rep_id = await _name_to_id(
+                db, organization_id, mapped.get("sales_rep_name", ""),
+                SalesRep, rep_cache,
             )
 
             # ── Deterministic derived fields + validation flags (Phase 4) ────
@@ -389,45 +445,46 @@ async def process_import(
                 derived.data_quality_flags.append("created_at_estimated_from_ingestion_time")
             stats["flags_raised"] += len(derived.data_quality_flags)
 
-            # ── Create lead (canonical schema) ───────────────────────────────
-            lead = Lead(
-                organization_id=organization_id,
-                project_id=project_id,
-                sales_rep_id=sales_rep_id,
-                name=mapped["name"],
-                phone_normalized=phone_normalized,
-                phone_raw=phone_raw or None,
-                email=email,
-                status=status,
-                status_raw=status_raw or None,
-                budget=budget,
-                source=mapped.get("source"),
-                campaign_name=mapped.get("campaign_name"),
-                property_type=mapped.get("property_type"),
-                lost_reason=mapped.get("lost_reason"),
-                commission_rate=commission_rate,
-                total_touches=total_touches,
-                created_at=created_at,
-                created_at_is_estimated=created_at_is_estimated,
-                last_followup_at=last_contact_at,
-                first_contact_at=first_contact_at,
-                site_visit_at=site_visit_at,
-                negotiation_at=negotiation_at,
-                closed_at=closed_at,
-                response_latency_minutes=derived.response_latency_minutes,
-                site_visit_latency_days=derived.site_visit_latency_days,
-                sales_cycle_days=derived.sales_cycle_days,
-                is_dark_lead=derived.is_dark_lead,
-                is_single_touch=derived.is_single_touch,
-                funnel_max_stage=derived.funnel_max_stage,
-                data_quality_flags=derived.to_flags_dict(),
-                created_from_import_id=import_id,
-            )
-            db.add(lead)
-            await db.flush()
+            lead_id = uuid.uuid4()
+
+            # ── Stage lead row (schema-identical to the ORM Lead) ───────────
+            lead_rows.append({
+                "id": lead_id,
+                "organization_id": organization_id,
+                "project_id": project_id,
+                "sales_rep_id": sales_rep_id,
+                "name": mapped["name"],
+                "phone_normalized": phone_normalized,
+                "phone_raw": phone_raw or None,
+                "email": email,
+                "status": status,
+                "status_raw": status_raw or None,
+                "budget": budget,
+                "source": mapped.get("source"),
+                "campaign_name": mapped.get("campaign_name"),
+                "property_type": mapped.get("property_type"),
+                "lost_reason": mapped.get("lost_reason"),
+                "commission_rate": commission_rate,
+                "total_touches": total_touches,
+                "created_at": created_at,
+                "created_at_is_estimated": created_at_is_estimated,
+                "last_followup_at": last_contact_at,
+                "first_contact_at": first_contact_at,
+                "site_visit_at": site_visit_at,
+                "negotiation_at": negotiation_at,
+                "closed_at": closed_at,
+                "response_latency_minutes": derived.response_latency_minutes,
+                "site_visit_latency_days": derived.site_visit_latency_days,
+                "sales_cycle_days": derived.sales_cycle_days,
+                "is_dark_lead": derived.is_dark_lead,
+                "is_single_touch": derived.is_single_touch,
+                "funnel_max_stage": derived.funnel_max_stage,
+                "data_quality_flags": derived.to_flags_dict(),
+                "created_from_import_id": import_id,
+            })
             stats["leads_created"] += 1
 
-            # ── Generate lifecycle events from VERIFIED timestamps (Phase 3) ──
+            # ── Stage lifecycle events from VERIFIED timestamps (Phase 3) ────
             for plan in plan_lifecycle_events(
                 created_at=created_at,
                 first_contact_at=first_contact_at,
@@ -438,22 +495,40 @@ async def process_import(
                 total_touches=total_touches,
                 source="import",
             ):
-                db.add(LeadEvent(
-                    organization_id=organization_id,
-                    lead_id=lead.id,
-                    event_type=plan["event_type"],
-                    event_payload={
+                event_rows.append({
+                    "id": uuid.uuid4(),
+                    "organization_id": organization_id,
+                    "lead_id": lead_id,
+                    "event_type": plan["event_type"],
+                    "event_payload": {
                         **plan["event_payload"],
                         "import_id": str(import_id),
                     },
-                    occurred_at=plan["occurred_at"],
-                    source="import",
-                ))
+                    "occurred_at": plan["occurred_at"],
+                    "source": "import",
+                    "created_at": utc_now(),
+                })
                 stats["events_created"] += 1
+
+            # ── Flush a batch: one executemany per table instead of per row ──
+            if len(lead_rows) >= batch_size:
+                await db.execute(insert(Lead), lead_rows)
+                if event_rows:
+                    await db.execute(insert(LeadEvent), event_rows)
+                lead_rows.clear()
+                event_rows.clear()
+                if on_progress is not None:
+                    await on_progress(stats["total_rows"], stats)
 
         except Exception as e:
             logger.error(f"Error processing row: {e}")
             stats["errors"] += 1
+
+    # Final partial batch
+    if lead_rows:
+        await db.execute(insert(Lead), lead_rows)
+        if event_rows:
+            await db.execute(insert(LeadEvent), event_rows)
 
     data_import.status = ImportStatus.COMPLETED.value
     data_import.row_count = stats["total_rows"]

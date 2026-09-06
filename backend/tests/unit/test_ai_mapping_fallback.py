@@ -233,43 +233,95 @@ async def test_suggestions_work_with_default_noop_provider(
 
 # ── Full pipeline: NVIDIA down must NOT fail the import ───────────────────
 @pytest.mark.asyncio
-async def test_import_completes_when_nvidia_unavailable(
-    test_session, import_with_file, monkeypatch
-):
-    """Confirm mappings and process the import while the NVIDIA provider is
-    down — the import must complete, never become FAILED."""
+async def test_import_completes_when_nvidia_unavailable(tmp_path, monkeypatch):
+    """Confirm mappings enqueues a background job; executing it completes the
+    import while the NVIDIA provider is down — never FAILED."""
+    from sqlalchemy import func, select
+
+    from app.models.lead import Lead
+    from app.models.background_job import BackgroundJob
+    from app.models.enums import JobStatus
+    from app.services import import_job
+
+    # Shared scratch DB so enqueue (one session) and job execution (other
+    # sessions) observe the same committed rows.
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
     def _exploding_factory():
         return _ExplodingProvider()
 
     monkeypatch.setattr(imports_api, "get_llm_provider", _exploding_factory)
 
-    body = ColumnMappingConfirm(
-        mappings=[
-            ColumnMappingItem(source_column="Lead Name", target_field="name"),
-            ColumnMappingItem(source_column="Phone", target_field="phone_raw"),
-            ColumnMappingItem(source_column="Email", target_field="email"),
-            ColumnMappingItem(source_column="Enquiry Date", target_field="created_at"),
-            ColumnMappingItem(source_column="First Contact", target_field="first_contact_at"),
-            ColumnMappingItem(source_column="Last Followup", target_field="last_followup_at"),
-            ColumnMappingItem(source_column="Site Visit", target_field="site_visit_at"),
-            ColumnMappingItem(source_column="Negotiation", target_field="negotiation_at"),
-            ColumnMappingItem(source_column="Closed", target_field="closed_at"),
-        ]
-    )
+    async with factory() as db:
+        org = Organization(id=uuid.uuid4(), name="AI Fallback Test Org", is_demo=True)
+        db.add(org)
+        await db.flush()
 
-    result = await imports_api.confirm_mappings(
-        str(import_with_file.id), body, test_session
-    )
+        csv_path = tmp_path / "sample.csv"
+        csv_path.write_text(SAMPLE_CSV, encoding="utf-8")
 
-    stats = result["import_stats"]
-    assert "error" not in stats, "import must not fail because NVIDIA is down"
-    assert stats["leads_created"] == 2
-    assert stats["events_created"] >= 1
+        imp = DataImport(
+            id=uuid.uuid4(),
+            organization_id=org.id,
+            filename="sample.csv",
+            file_type="csv",
+            raw_storage_path=str(csv_path),
+            status=ImportStatus.UPLOADED.value,
+            persisted_columns=json.dumps([
+                "Lead Name", "Phone", "Email", "Enquiry Date", "First Contact",
+                "Last Followup", "Site Visit", "Negotiation", "Closed",
+            ]),
+            persisted_preview_rows=json.dumps([]),
+        )
+        db.add(imp)
+        await db.flush()
 
-    await test_session.refresh(import_with_file)
-    assert import_with_file.status == ImportStatus.COMPLETED.value
-    assert import_with_file.row_count == 2
-    assert import_with_file.error_message is None
+        body = ColumnMappingConfirm(
+            mappings=[
+                ColumnMappingItem(source_column="Lead Name", target_field="name"),
+                ColumnMappingItem(source_column="Phone", target_field="phone_raw"),
+                ColumnMappingItem(source_column="Email", target_field="email"),
+                ColumnMappingItem(source_column="Enquiry Date", target_field="created_at"),
+                ColumnMappingItem(source_column="First Contact", target_field="first_contact_at"),
+                ColumnMappingItem(source_column="Last Followup", target_field="last_followup_at"),
+                ColumnMappingItem(source_column="Site Visit", target_field="site_visit_at"),
+                ColumnMappingItem(source_column="Negotiation", target_field="negotiation_at"),
+                ColumnMappingItem(source_column="Closed", target_field="closed_at"),
+            ]
+        )
+
+        result = await imports_api.confirm_mappings(str(imp.id), body, db)
+        # confirm_mappings flushes only; simulate get_db's end-of-request commit.
+        await db.commit()
+
+        # /map now returns immediately — it must NOT run the pipeline inline.
+        assert result["job_id"]
+        assert result["status"] == JobStatus.PENDING.value
+        import_id = imp.id
+
+    await import_job.execute_job(uuid.UUID(result["job_id"]), session_factory=factory)
+
+    async with factory() as db:
+        data_import = await db.get(DataImport, import_id)
+        assert data_import.status == ImportStatus.COMPLETED.value
+        assert data_import.row_count == 2
+        assert data_import.error_message is None
+
+        leads_count = (await db.execute(
+            select(func.count(Lead.id)).where(Lead.created_from_import_id == import_id)
+        )).scalar()
+        assert leads_count == 2
+
+        job = await db.get(BackgroundJob, uuid.UUID(result["job_id"]))
+        assert job.status == JobStatus.COMPLETED.value
+        assert (job.payload or {}).get("stage") == "done"
+        assert job.payload["import_stats"]["leads_created"] == 2
+        assert job.payload["leakage_stats"]["total_events"] >= 1
+
+    await engine.dispose()
 
 
 # ── Neither file nor persisted metadata → sanitized error ──────────────────

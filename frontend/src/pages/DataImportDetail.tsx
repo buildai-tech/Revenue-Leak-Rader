@@ -56,6 +56,27 @@ interface SuggestionsResponse {
   refinement_pending?: boolean;
 }
 
+// Loader visible while a background import pipeline runs; matches the backend
+// ImportStatus values surfaced by the processing endpoint.
+type ImportStage = 'pending' | 'running' | 'completed' | 'failed' | 'none';
+
+interface ProcessingResponse {
+  job_id?: string | null;
+  status: ImportStage;
+  import_status?: string;
+  stage?: string;
+  processed_rows?: number;
+  total_rows?: number;
+  leads_created?: number;
+  errors?: number;
+  error?: string | null;
+  stats?: {
+    import_stats?: Record<string, number | string>;
+    merge_stats?: Record<string, number>;
+    leakage_stats?: Record<string, number | object>;
+  } | null;
+}
+
 export const DataImportDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -64,6 +85,9 @@ export const DataImportDetail: React.FC = () => {
   const [mappings, setMappings] = useState<Record<string, string>>({});
   const [step, setStep] = useState<1 | 2 | 3 | 4>(2); // 1: Upload (done), 2: Preview & Map, 3: Process, 4: Results
   const [processingStats, setProcessingStats] = useState<any>(null);
+  // True once the user fired "Confirm Mapping & Run Detection" — the pipeline
+  // runs as a backend background job and the page polls for completion.
+  const [jobStarted, setJobStarted] = useState(false);
   // Once the user hand-adjusts a dropdown, never clobber their choice again —
   // even when the async AI refinement lands and the suggestions are re-fetched.
   const userEditedRef = useRef(false);
@@ -73,6 +97,37 @@ export const DataImportDetail: React.FC = () => {
     queryFn: () => fetchApi(`/imports/${id}`),
     enabled: !!id,
   });
+
+  // Poll the background pipeline job while it is pending/running. Also engages
+  // on page refresh if the import was already mid-pipeline server-side.
+  const pipelineActive = jobStarted || importData?.status === 'processing';
+  const { data: processing } = useQuery<ProcessingResponse>({
+    queryKey: ['import-processing', id],
+    queryFn: () => fetchApi(`/imports/${id}/processing`),
+    enabled: pipelineActive && !!id,
+    refetchInterval: (query) => {
+      const d = query.state.data as ProcessingResponse | undefined;
+      return d && (d.status === 'pending' || d.status === 'running') ? 2000 : false;
+    },
+  });
+
+  // Terminal states: completed → show results; failed → surface the error.
+  useEffect(() => {
+    if (!processing || !pipelineActive) return;
+    if (processing.status === 'completed' && processing.stats) {
+      setProcessingStats(processing.stats);
+      setJobStarted(false);
+      setStep(4);
+      queryClient.invalidateQueries({ queryKey: ['dashboard-summary'] });
+      queryClient.invalidateQueries({ queryKey: ['leads-list'] });
+      queryClient.invalidateQueries({ queryKey: ['leakage-list'] });
+    }
+    if (processing.status === 'failed') {
+      setJobStarted(false);
+      setStep(2);
+      queryClient.invalidateQueries({ queryKey: ['import-detail', id] });
+    }
+  }, [processing, pipelineActive, queryClient]);
 
   const { data: suggestionsData, isError: suggestionsError } = useQuery<SuggestionsResponse>({
     queryKey: ['import-suggestions', id],
@@ -108,12 +163,9 @@ export const DataImportDetail: React.FC = () => {
         body: JSON.stringify({ mappings: mappingList }),
       });
     },
-    onSuccess: (data) => {
-      setProcessingStats(data);
-      setStep(4);
-      queryClient.invalidateQueries({ queryKey: ['dashboard-summary'] });
-      queryClient.invalidateQueries({ queryKey: ['leads-list'] });
-      queryClient.invalidateQueries({ queryKey: ['leakage-list'] });
+    onSuccess: () => {
+      setJobStarted(true);
+      setStep(3);
     },
   });
 
@@ -265,7 +317,7 @@ export const DataImportDetail: React.FC = () => {
                 className="px-5 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg transition-colors shadow-lg shadow-blue-600/20 flex items-center gap-2"
               >
                 <Play className="w-3.5 h-3.5" />
-                {processMutation.isPending ? 'Executing Pipeline...' : 'Confirm Mapping & Run Detection'}
+                {processMutation.isPending ? 'Starting...' : 'Confirm Mapping & Run Detection'}
               </button>
             </div>
           </div>
@@ -298,6 +350,63 @@ export const DataImportDetail: React.FC = () => {
               </table>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Step 3: Run Pipeline (background job — poll progress, browser may close) */}
+      {step === 3 && (
+        <div className="bg-[#0f172a]/90 border border-slate-800 rounded-xl p-8 space-y-6 text-center max-w-2xl mx-auto shadow-2xl">
+          <div className="w-16 h-16 rounded-full bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-blue-400 mx-auto">
+            <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          </div>
+
+          <div className="space-y-1">
+            <h2 className="text-xl font-bold text-white">Executing Pipeline in Background</h2>
+            <p className="text-xs text-slate-400">
+              The import runs as a background job — you may close this tab and check the batch
+              status later. Progress is persisted server-side.
+            </p>
+          </div>
+
+          {processing?.stage && (
+            <div className="text-xs font-mono text-slate-300 bg-slate-950 rounded-lg border border-slate-800 px-4 py-2">
+              Stage: {processing.stage}
+            </div>
+          )}
+
+          {(processing?.total_rows ?? 0) > 0 && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs text-slate-400">
+                <span>
+                  {(processing?.processed_rows ?? 0).toLocaleString()} /{' '}
+                  {(processing?.total_rows ?? 0).toLocaleString()} records
+                </span>
+                <span>{processing?.leads_created?.toLocaleString()} leads created</span>
+              </div>
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 rounded-full transition-all duration-500"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(
+                        ((processing?.processed_rows ?? 0) / (processing?.total_rows || 1)) * 100,
+                      ),
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {processing?.error && (
+            <div className="flex items-start gap-2 bg-rose-500/10 border border-rose-500/30 rounded-lg p-3 text-left">
+              <AlertCircle className="w-4 h-4 text-rose-400 mt-0.5 shrink-0" />
+              <p className="text-xs text-slate-300 break-words">
+                {sanitizeErrorMessage(processing.error)}
+              </p>
+            </div>
+          )}
         </div>
       )}
 
